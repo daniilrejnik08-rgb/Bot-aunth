@@ -1,672 +1,665 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import time
-import asyncio
+import time, asyncio, random, re
 from datetime import datetime, timezone
 from collections import defaultdict
 
-from config import (
-    TOKEN, VERIFY_TIMEOUT,
-    SPAM_MESSAGES, SPAM_SECONDS, SPAM_MUTE_MINUTES,
-    MAX_MENTIONS, MAX_EVERYONE, BAD_WORDS_ACTION,
-    COLOR_SUCCESS, COLOR_ERROR, COLOR_INFO, COLOR_WARNING,
-    COLOR_WELCOME, COLOR_MUTE
-)
-from database import (
-    init_db, get_guild_settings, set_guild_settings,
-    add_pending, remove_pending, get_pending,
-    add_channel_mute, remove_channel_mute,
-    add_bad_word, remove_bad_word, get_bad_words,
-    add_report
-)
+from config import *
+from database import *
 
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# Антиспам: {guild_id: {user_id: [timestamps]}}
 spam_tracker = defaultdict(lambda: defaultdict(list))
 
 
-# ==================== HELPERS ====================
-
-async def send_mod_log(guild: discord.Guild, embed: discord.Embed):
-    settings = await get_guild_settings(guild.id)
-    if not settings:
-        return
-    channel_id = settings.get("mod_log_channel_id") or settings.get("log_channel_id")
-    if channel_id:
-        channel = guild.get_channel(channel_id)
-        if channel:
-            try:
-                await channel.send(embed=embed)
-            except Exception:
-                pass
+def fmt(sec: float) -> str:
+    sec = int(max(0, sec))
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    if h: return f"{h}ч {m}м"
+    if m: return f"{m}м {s}с"
+    return f"{s}с"
 
 
-async def apply_muted_role(member: discord.Member, reason: str = "Мут"):
-    settings = await get_guild_settings(member.guild.id)
-    if not settings or not settings.get("muted_role_id"):
+def is_valid_image_url(url: str) -> bool:
+    if not url or not url.startswith(("http://", "https://")):
         return False
-    role = member.guild.get_role(settings["muted_role_id"])
-    if not role:
-        return False
+    return any(url.lower().split("?")[0].endswith(ext) for ext in (
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".gifv"
+    )) or "imgur" in url or "tenor" in url or "giphy" in url or "discord" in url or "media" in url
+
+
+async def modlog(guild, embed):
+    s = await get_guild_settings(guild.id)
+    if not s: return
+    cid = s.get("mod_log_channel_id") or s.get("log_channel_id")
+    if cid:
+        ch = guild.get_channel(cid)
+        if ch:
+            try: await ch.send(embed=embed)
+            except: pass
+
+
+async def mute_role(member, reason="Мут"):
+    s = await get_guild_settings(member.guild.id)
+    if not s or not s.get("muted_role_id"): return False
+    role = member.guild.get_role(s["muted_role_id"])
+    if not role: return False
     try:
         await member.add_roles(role, reason=reason)
         return True
-    except discord.Forbidden:
-        return False
+    except: return False
 
 
-async def remove_muted_role(member: discord.Member, reason: str = "Размут"):
-    settings = await get_guild_settings(member.guild.id)
-    if not settings or not settings.get("muted_role_id"):
-        return False
-    role = member.guild.get_role(settings["muted_role_id"])
-    if not role:
-        return False
+async def unmute_role(member, reason="Размут"):
+    s = await get_guild_settings(member.guild.id)
+    if not s or not s.get("muted_role_id"): return False
+    role = member.guild.get_role(s["muted_role_id"])
+    if not role: return False
     try:
         await member.remove_roles(role, reason=reason)
         return True
-    except discord.Forbidden:
-        return False
+    except: return False
 
 
-# ==================== VIEWS ====================
+async def build_profile_embed(member: discord.Member) -> discord.Embed:
+    w, b = await get_balance(member.id, member.guild.id)
+    prof = await get_profile(member.id, member.guild.id)
+    color = prof["color"] or GOLD
+
+    emb = discord.Embed(color=color, timestamp=datetime.now(timezone.utc))
+    emb.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+
+    if prof["bio"]:
+        emb.description = f"*{prof['bio']}*"
+
+    emb.add_field(name="Кошелёк", value=f"```{w:,} {CURRENCY}```", inline=True)
+    emb.add_field(name="Банк", value=f"```{b:,} {CURRENCY}```", inline=True)
+    emb.add_field(name="Всего", value=f"```{w + b:,} {CURRENCY}```", inline=True)
+
+    emb.set_thumbnail(url=member.display_avatar.url)
+
+    if prof["banner"]:
+        emb.set_image(url=prof["banner"])
+
+    joined = discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "—"
+    emb.set_footer(text=f"На сервере {joined}  •  ID: {member.id}")
+    return emb
+
+
+# ═══════════════════ PROFILE + ECO PANEL ═══════════════════
+
+class ProfileView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.owner_id:
+            await inter.response.send_message("Это чужой профиль.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Daily", emoji="🎁", style=discord.ButtonStyle.success, row=0)
+    async def daily(self, inter: discord.Interaction, _):
+        last = await get_cd(inter.user.id, inter.guild.id, "last_daily")
+        left = DAILY_COOLDOWN - (time.time() - last)
+        if left > 0:
+            return await inter.response.send_message(f"⏳ Через **{fmt(left)}**", ephemeral=True)
+        amount = random.randint(DAILY_MIN, DAILY_MAX)
+        await add_money(inter.user.id, inter.guild.id, amount)
+        await set_cd(inter.user.id, inter.guild.id, "last_daily", time.time())
+        await inter.response.send_message(
+            embed=discord.Embed(title="🎁 Daily", description=f"+**{amount:,}** {CURRENCY}", color=GREEN),
+            ephemeral=True)
+        await inter.message.edit(embed=await build_profile_embed(inter.user), view=self)
+
+    @discord.ui.button(label="Work", emoji="💼", style=discord.ButtonStyle.primary, row=0)
+    async def work(self, inter: discord.Interaction, _):
+        last = await get_cd(inter.user.id, inter.guild.id, "last_work")
+        left = WORK_COOLDOWN - (time.time() - last)
+        if left > 0:
+            return await inter.response.send_message(f"⏳ Через **{fmt(left)}**", ephemeral=True)
+        jobs = ["программистом", "курьером", "стримером", "поваром", "дизайнером", "таксистом"]
+        amount = random.randint(WORK_MIN, WORK_MAX)
+        await add_money(inter.user.id, inter.guild.id, amount)
+        await set_cd(inter.user.id, inter.guild.id, "last_work", time.time())
+        await inter.response.send_message(
+            embed=discord.Embed(title="💼 Work", description=f"Работал **{random.choice(jobs)}**\n+**{amount:,}** {CURRENCY}", color=BLURPLE),
+            ephemeral=True)
+        await inter.message.edit(embed=await build_profile_embed(inter.user), view=self)
+
+    @discord.ui.button(label="Crime", emoji="🔫", style=discord.ButtonStyle.danger, row=0)
+    async def crime(self, inter: discord.Interaction, _):
+        last = await get_cd(inter.user.id, inter.guild.id, "last_crime")
+        left = CRIME_COOLDOWN - (time.time() - last)
+        if left > 0:
+            return await inter.response.send_message(f"⏳ Через **{fmt(left)}**", ephemeral=True)
+        await set_cd(inter.user.id, inter.guild.id, "last_crime", time.time())
+        if random.randint(1, 100) <= CRIME_CHANCE:
+            amount = random.randint(CRIME_MIN, CRIME_MAX)
+            await add_money(inter.user.id, inter.guild.id, amount)
+            emb = discord.Embed(title="🔫 Успех", description=f"+**{amount:,}** {CURRENCY}", color=GREEN)
+        else:
+            await add_money(inter.user.id, inter.guild.id, -CRIME_FAIL)
+            emb = discord.Embed(title="🚔 Поймали", description=f"Штраф **{CRIME_FAIL}** {CURRENCY}", color=RED)
+        await inter.response.send_message(embed=emb, ephemeral=True)
+        await inter.message.edit(embed=await build_profile_embed(inter.user), view=self)
+
+    @discord.ui.button(label="Банк", emoji="🏦", style=discord.ButtonStyle.secondary, row=1)
+    async def bank(self, inter: discord.Interaction, _):
+        await inter.response.send_modal(BankModal())
+
+    @discord.ui.button(label="Магазин", emoji="🛒", style=discord.ButtonStyle.secondary, row=1)
+    async def shop(self, inter: discord.Interaction, _):
+        items = await get_shop(inter.guild.id)
+        if not items:
+            return await inter.response.send_message("Магазин пуст. Админ: `/additem`", ephemeral=True)
+        options = [discord.SelectOption(
+            label=f"{name} — {price} {CURRENCY}"[:100],
+            value=str(iid),
+            description=(desc or "")[:100]
+        ) for iid, name, price, desc, _ in items[:25]]
+        view = discord.ui.View(timeout=60)
+        select = discord.ui.Select(placeholder="Выбери товар...", options=options)
+
+        async def cb(i: discord.Interaction):
+            item = await get_item(int(select.values[0]), i.guild.id)
+            if not item:
+                return await i.response.send_message("Не найден.", ephemeral=True)
+            _, name, price, _, role_id = item
+            w, _ = await get_balance(i.user.id, i.guild.id)
+            if w < price:
+                return await i.response.send_message(f"Нужно **{price}** {CURRENCY}", ephemeral=True)
+            await add_money(i.user.id, i.guild.id, -price)
+            if role_id:
+                role = i.guild.get_role(role_id)
+                if role:
+                    try: await i.user.add_roles(role, reason=f"Покупка {name}")
+                    except:
+                        await add_money(i.user.id, i.guild.id, price)
+                        return await i.response.send_message("Нет прав на роль.", ephemeral=True)
+            else:
+                await add_inv(i.user.id, i.guild.id, item[0])
+            await i.response.send_message(
+                embed=discord.Embed(title="🛒 Куплено", description=f"**{name}** за **{price}** {CURRENCY}", color=GREEN),
+                ephemeral=True)
+
+        select.callback = cb
+        view.add_item(select)
+        await inter.response.send_message(embed=discord.Embed(title="🛒 Магазин", color=PINK), view=view, ephemeral=True)
+
+    @discord.ui.button(label="Настроить", emoji="🎨", style=discord.ButtonStyle.secondary, row=1)
+    async def customize(self, inter: discord.Interaction, _):
+        await inter.response.send_message(
+            embed=discord.Embed(
+                title="🎨 Кастомизация профиля",
+                description=(
+                    f"**Баннер (GIF/картинка)** — `{PRICE_BANNER}` {CURRENCY}\n`/setbanner <ссылка>`\n\n"
+                    f"**Описание** — `{PRICE_BIO}` {CURRENCY}\n`/setbio <текст>`\n\n"
+                    f"**Цвет полоски** — `{PRICE_COLOR}` {CURRENCY}\n`/setcolor #FFAA00`\n\n"
+                    f"**Сбросить баннер** — бесплатно\n`/setbanner none`"
+                ),
+                color=BLURPLE
+            ),
+            ephemeral=True
+        )
+
+
+class BankModal(discord.ui.Modal, title="Банк"):
+    amount = discord.ui.TextInput(label="Сумма (или all)", placeholder="100 / all", required=True)
+    action = discord.ui.TextInput(label="Действие: deposit или withdraw", placeholder="deposit", required=True, max_length=10)
+
+    async def on_submit(self, inter: discord.Interaction):
+        w, b = await get_balance(inter.user.id, inter.guild.id)
+        raw = self.amount.value.strip().lower()
+        act = self.action.value.strip().lower()
+        try:
+            amt = w if (act.startswith("d") and raw == "all") else b if (act.startswith("w") and raw == "all") else int(raw)
+        except:
+            return await inter.response.send_message("Неверная сумма.", ephemeral=True)
+        if amt <= 0:
+            return await inter.response.send_message("Сумма > 0", ephemeral=True)
+
+        if act.startswith("d"):
+            if amt > w:
+                return await inter.response.send_message("Мало в кошельке.", ephemeral=True)
+            await add_money(inter.user.id, inter.guild.id, -amt)
+            await add_bank(inter.user.id, inter.guild.id, amt)
+            emb = discord.Embed(title="🏦 Депозит", description=f"**{amt:,}** {CURRENCY} → банк", color=GREEN)
+        elif act.startswith("w"):
+            if amt > b:
+                return await inter.response.send_message("Мало в банке.", ephemeral=True)
+            await add_bank(inter.user.id, inter.guild.id, -amt)
+            await add_money(inter.user.id, inter.guild.id, amt)
+            emb = discord.Embed(title="💸 Снятие", description=f"**{amt:,}** {CURRENCY} ← банк", color=GREEN)
+        else:
+            return await inter.response.send_message("Пиши `deposit` или `withdraw`", ephemeral=True)
+        await inter.response.send_message(embed=emb, ephemeral=True)
+
+
+# ═══════════════════ VERIFY ═══════════════════
 
 class VerifyView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="Пройти верификацию",
-        style=discord.ButtonStyle.success,
-        emoji="✅",
-        custom_id="verify_button"
-    )
-    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        member = interaction.user
-        settings = await get_guild_settings(guild.id)
+    @discord.ui.button(label="Пройти верификацию", style=discord.ButtonStyle.success, emoji="✅", custom_id="verify_btn")
+    async def verify(self, inter: discord.Interaction, _):
+        g, m = inter.guild, inter.user
+        s = await get_guild_settings(g.id)
+        if not s or not s["verified_role_id"]:
+            return await inter.response.send_message("Не настроено.", ephemeral=True)
+        vrole = g.get_role(s["verified_role_id"])
+        urole = g.get_role(s["unverified_role_id"]) if s["unverified_role_id"] else None
+        if vrole in m.roles:
+            return await inter.response.send_message("Уже верифицирован!", ephemeral=True)
+        try:
+            await m.add_roles(vrole, reason="Верификация")
+            if urole and urole in m.roles:
+                await m.remove_roles(urole, reason="Верификация")
+        except discord.Forbidden:
+            return await inter.response.send_message(
+                embed=discord.Embed(title="Нет прав", description="Подними роль бота **выше** выдаваемых ролей.", color=RED),
+                ephemeral=True)
 
-        if not settings or not settings["verified_role_id"]:
-            embed = discord.Embed(title="Ошибка", description="Верификация ещё не настроена.", color=COLOR_ERROR)
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
+        await remove_pending(m.id, g.id)
+        await ensure_user(m.id, g.id, START_BALANCE)
 
-        verified_role = guild.get_role(settings["verified_role_id"])
-        unverified_role = guild.get_role(settings["unverified_role_id"]) if settings["unverified_role_id"] else None
-
-        if verified_role in member.roles:
-            embed = discord.Embed(title="Уже верифицирован", description="Ты уже прошёл верификацию!", color=COLOR_SUCCESS)
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
+        wch = g.get_channel(s["welcome_channel_id"]) if s["welcome_channel_id"] else None
+        if wch:
+            emb = discord.Embed(title="✨ Добро пожаловать!", description=f"{m.mention}, рады тебя видеть!", color=PINK)
+            emb.set_thumbnail(url=m.display_avatar.url)
+            if g.icon: emb.set_author(name=g.name, icon_url=g.icon.url)
+            emb.set_footer(text=f"#{g.member_count}  •  +{START_BALANCE} {CURRENCY}")
+            await wch.send(embed=emb)
 
         try:
-            await member.add_roles(verified_role, reason="Верификация")
-            if unverified_role and unverified_role in member.roles:
-                await member.remove_roles(unverified_role, reason="Верификация")
-        except discord.Forbidden:
-            embed = discord.Embed(title="Ошибка прав", description="У бота нет прав выдавать роли.", color=COLOR_ERROR)
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
+            await m.send(embed=discord.Embed(
+                title=f"Добро пожаловать на {g.name}",
+                description=f"Верификация пройдена.\nСтартовый баланс: **{START_BALANCE}** {CURRENCY}\n\nНастрой профиль: `/profile`",
+                color=PINK))
+        except: pass
 
-        await remove_pending(member.id, guild.id)
+        lch = g.get_channel(s["log_channel_id"]) if s["log_channel_id"] else None
+        if lch:
+            e = discord.Embed(title="✅ Верификация", color=GREEN, timestamp=datetime.now(timezone.utc))
+            e.add_field(name="Участник", value=f"{m.mention}\n`{m.id}`")
+            e.set_thumbnail(url=m.display_avatar.url)
+            await lch.send(embed=e)
 
-        welcome_channel = guild.get_channel(settings["welcome_channel_id"]) if settings["welcome_channel_id"] else None
-        if welcome_channel:
-            embed = discord.Embed(
-                title="Добро пожаловать!",
-                description=f"Привет, {member.mention}!\n\nРады видеть тебя на **{guild.name}**.",
-                color=COLOR_WELCOME,
-                timestamp=datetime.now(timezone.utc)
-            )
-            embed.set_thumbnail(url=member.display_avatar.url)
-            if guild.icon:
-                embed.set_author(name=guild.name, icon_url=guild.icon.url)
-            embed.set_footer(text=f"Участник #{guild.member_count}")
-            await welcome_channel.send(embed=embed)
-
-        try:
-            dm_embed = discord.Embed(
-                title=f"Добро пожаловать на {guild.name}!",
-                description=f"Привет, **{member.display_name}**!\n\nТы успешно прошёл верификацию.",
-                color=COLOR_WELCOME
-            )
-            if guild.icon:
-                dm_embed.set_thumbnail(url=guild.icon.url)
-            await member.send(embed=dm_embed)
-        except discord.Forbidden:
-            pass
-
-        log_channel = guild.get_channel(settings["log_channel_id"]) if settings["log_channel_id"] else None
-        if log_channel:
-            embed = discord.Embed(title="Верификация пройдена", color=COLOR_SUCCESS, timestamp=datetime.now(timezone.utc))
-            embed.add_field(name="Пользователь", value=f"{member.mention}\n`{member}`", inline=True)
-            embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
-            embed.set_thumbnail(url=member.display_avatar.url)
-            await log_channel.send(embed=embed)
-
-        success_embed = discord.Embed(
-            title="Верификация пройдена!",
-            description=f"Добро пожаловать, {member.mention}!",
-            color=COLOR_SUCCESS
-        )
-        await interaction.response.send_message(embed=success_embed, ephemeral=True)
+        await inter.response.send_message(embed=discord.Embed(title="Готово! 🎉", color=GREEN), ephemeral=True)
 
 
-class ReportModal(discord.ui.Modal, title="Жалоба на участника"):
-    reason = discord.ui.TextInput(
-        label="Причина жалобы",
-        style=discord.TextStyle.paragraph,
-        placeholder="Опиши, что произошло...",
-        required=True,
-        max_length=1000
-    )
-
-    def __init__(self, reported: discord.Member):
-        super().__init__()
-        self.reported = reported
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await add_report(
-            interaction.guild.id,
-            interaction.user.id,
-            self.reported.id,
-            self.reason.value,
-            time.time()
-        )
-
-        embed = discord.Embed(
-            title="Новая жалоба",
-            color=COLOR_WARNING,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Кто пожаловался", value=f"{interaction.user.mention} (`{interaction.user}`)", inline=False)
-        embed.add_field(name="На кого", value=f"{self.reported.mention} (`{self.reported}`)", inline=False)
-        embed.add_field(name="Причина", value=self.reason.value, inline=False)
-        embed.set_thumbnail(url=self.reported.display_avatar.url)
-
-        await send_mod_log(interaction.guild, embed)
-
-        confirm = discord.Embed(
-            title="Жалоба отправлена",
-            description="Модераторы получили твою жалобу. Спасибо!",
-            color=COLOR_SUCCESS
-        )
-        await interaction.response.send_message(embed=confirm, ephemeral=True)
+class ReportModal(discord.ui.Modal, title="Жалоба"):
+    reason = discord.ui.TextInput(label="Что произошло?", style=discord.TextStyle.paragraph, max_length=1000)
+    def __init__(self, target): super().__init__(); self.target = target
+    async def on_submit(self, inter: discord.Interaction):
+        await add_report(inter.guild.id, inter.user.id, self.target.id, self.reason.value, time.time())
+        e = discord.Embed(title="🚨 Жалоба", color=GOLD, timestamp=datetime.now(timezone.utc))
+        e.add_field(name="От", value=inter.user.mention, inline=True)
+        e.add_field(name="На", value=self.target.mention, inline=True)
+        e.add_field(name="Причина", value=self.reason.value, inline=False)
+        e.set_thumbnail(url=self.target.display_avatar.url)
+        await modlog(inter.guild, e)
+        await inter.response.send_message(embed=discord.Embed(title="Отправлено", color=GREEN), ephemeral=True)
 
 
-# ==================== EVENTS ====================
+# ═══════════════════ EVENTS ═══════════════════
 
 @bot.event
 async def on_ready():
     await init_db()
     bot.add_view(VerifyView())
-    print(f"✅ Бот запущен как {bot.user}")
-    print(f"📊 Серверов: {len(bot.guilds)}")
+    print(f"✅ {bot.user} | серверов: {len(bot.guilds)}")
     check_timeouts.start()
-    try:
-        synced = await bot.tree.sync()
-        print(f"🔄 Команд синхронизировано: {len(synced)}")
-    except Exception as e:
-        print(f"Ошибка синхронизации: {e}")
+    try: print(f"🔄 {len(await bot.tree.sync())} команд")
+    except Exception as e: print(e)
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    if member.bot:
-        return
-
-    settings = await get_guild_settings(member.guild.id)
-    if not settings:
-        return
-
-    if settings.get("unverified_role_id"):
-        role = member.guild.get_role(settings["unverified_role_id"])
+    if member.bot: return
+    s = await get_guild_settings(member.guild.id)
+    if not s: return
+    if s.get("unverified_role_id"):
+        role = member.guild.get_role(s["unverified_role_id"])
         if role:
-            try:
-                await member.add_roles(role, reason="Новый участник")
-            except discord.Forbidden:
-                pass
-
+            try: await member.add_roles(role, reason="Новый")
+            except: pass
     await add_pending(member.id, member.guild.id, time.time())
-
-    verify_channel = member.guild.get_channel(settings["verify_channel_id"]) if settings.get("verify_channel_id") else None
-    if verify_channel:
-        embed = discord.Embed(
-            title="Требуется верификация",
-            description=(
-                f"Привет, {member.mention}!\n\n"
-                f"Чтобы получить доступ к серверу, нажми кнопку ниже.\n\n"
-                f"⏱ У тебя есть **{settings['verify_timeout']} минут**."
-            ),
-            color=COLOR_INFO
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        if member.guild.icon:
-            embed.set_author(name=member.guild.name, icon_url=member.guild.icon.url)
-        await verify_channel.send(content=member.mention, embed=embed, view=VerifyView())
+    ch = member.guild.get_channel(s["verify_channel_id"]) if s.get("verify_channel_id") else None
+    if ch:
+        emb = discord.Embed(title="🔐 Верификация", description=f"Привет, {member.mention}!\nНажми кнопку.\n⏱ **{s['verify_timeout']} мин.**", color=BLURPLE)
+        emb.set_thumbnail(url=member.display_avatar.url)
+        await ch.send(content=member.mention, embed=emb, view=VerifyView())
 
 
 @bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
-
-    # ----- Антиспам -----
+async def on_message(msg: discord.Message):
+    if msg.author.bot or not msg.guild: return
     now = time.time()
-    user_times = spam_tracker[message.guild.id][message.author.id]
-    user_times.append(now)
-    user_times[:] = [t for t in user_times if now - t < SPAM_SECONDS]
-
-    if len(user_times) >= SPAM_MESSAGES:
-        spam_tracker[message.guild.id][message.author.id].clear()
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-        await apply_muted_role(message.author, reason=f"Антиспам ({SPAM_MESSAGES} сообщ. / {SPAM_SECONDS} сек)")
-        embed = discord.Embed(
-            title="Антиспам",
-            description=f"{message.author.mention} получил мут за спам.",
-            color=COLOR_MUTE,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Причина", value=f"{SPAM_MESSAGES} сообщений за {SPAM_SECONDS} сек.")
-        await send_mod_log(message.guild, embed)
-
-        try:
-            await message.channel.send(
-                f"{message.author.mention}, слишком быстро пишешь. Мут на {SPAM_MUTE_MINUTES} мин.",
-                delete_after=10
-            )
-        except Exception:
-            pass
-
-        async def auto_unmute():
+    t = spam_tracker[msg.guild.id][msg.author.id]
+    t.append(now)
+    t[:] = [x for x in t if now - x < SPAM_SECONDS]
+    if len(t) >= SPAM_MESSAGES:
+        spam_tracker[msg.guild.id][msg.author.id].clear()
+        try: await msg.delete()
+        except: pass
+        await mute_role(msg.author, "Антиспам")
+        async def au():
             await asyncio.sleep(SPAM_MUTE_MINUTES * 60)
-            await remove_muted_role(message.author, reason="Авторазмут после спама")
-        bot.loop.create_task(auto_unmute())
+            await unmute_role(msg.author)
+        bot.loop.create_task(au())
         return
-
-    # ----- Антирассылка -----
-    mention_count = len(message.mentions)
-    has_everyone = message.mention_everyone
-
-    if mention_count >= MAX_MENTIONS or has_everyone:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-        await apply_muted_role(message.author, reason="Антирассылка (массовые упоминания)")
-        embed = discord.Embed(
-            title="Антирассылка",
-            description=f"{message.author.mention} попытался сделать массовое упоминание.",
-            color=COLOR_ERROR,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Упоминаний", value=str(mention_count))
-        embed.add_field(name="@everyone/@here", value="Да" if has_everyone else "Нет")
-        await send_mod_log(message.guild, embed)
-
-        try:
-            await message.channel.send(
-                f"{message.author.mention}, массовые упоминания запрещены.",
-                delete_after=8
-            )
-        except Exception:
-            pass
+    if len(msg.mentions) >= MAX_MENTIONS or msg.mention_everyone:
+        try: await msg.delete()
+        except: pass
+        await mute_role(msg.author, "Антирассылка")
         return
+    words = await get_bad_words(msg.guild.id)
+    if words and any(w in msg.content.lower() for w in words):
+        try: await msg.delete()
+        except: pass
+        if BAD_WORDS_ACTION in ("mute", "both"):
+            await mute_role(msg.author, "Плохие слова")
+        return
+    await bot.process_commands(msg)
 
-    # ----- Автомод плохих слов -----
-    bad_words = await get_bad_words(message.guild.id)
-    if bad_words:
-        content_lower = message.content.lower()
-        found = [w for w in bad_words if w in content_lower]
-        if found:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-
-            if BAD_WORDS_ACTION in ("mute", "both"):
-                await apply_muted_role(message.author, reason=f"Плохие слова: {', '.join(found)}")
-
-            embed = discord.Embed(
-                title="Автомод: плохие слова",
-                description=f"Сообщение от {message.author.mention} удалено.",
-                color=COLOR_WARNING,
-                timestamp=datetime.now(timezone.utc)
-            )
-            embed.add_field(name="Найденные слова", value=", ".join(f"`{w}`" for w in found))
-            embed.add_field(name="Канал", value=message.channel.mention)
-            await send_mod_log(message.guild, embed)
-
-            try:
-                await message.channel.send(
-                    f"{message.author.mention}, такое писать нельзя.",
-                    delete_after=6
-                )
-            except Exception:
-                pass
-            return
-
-    await bot.process_commands(message)
-
-
-# ==================== TASKS ====================
 
 @tasks.loop(minutes=1)
 async def check_timeouts():
-    pending = await get_pending()
-    now = time.time()
-
-    for user_id, guild_id, joined_at in pending:
-        settings = await get_guild_settings(guild_id)
-        timeout = (settings["verify_timeout"] if settings else VERIFY_TIMEOUT) * 60
-
-        if now - joined_at > timeout:
-            guild = bot.get_guild(guild_id)
-            if not guild:
-                await remove_pending(user_id, guild_id)
-                continue
-
-            member = guild.get_member(user_id)
-            if member:
+    for uid, gid, joined in await get_pending():
+        s = await get_guild_settings(gid)
+        to = (s["verify_timeout"] if s else VERIFY_TIMEOUT) * 60
+        if time.time() - joined > to:
+            g = bot.get_guild(gid)
+            if g and (m := g.get_member(uid)):
                 try:
-                    await member.kick(reason="Не прошёл верификацию вовремя")
-                    embed = discord.Embed(
-                        title="Кик за отсутствие верификации",
-                        description=f"{member} (`{member.id}`)",
-                        color=COLOR_WARNING,
-                        timestamp=datetime.now(timezone.utc)
-                    )
-                    await send_mod_log(guild, embed)
-                except discord.Forbidden:
-                    pass
-            await remove_pending(user_id, guild_id)
+                    await m.kick(reason="Не прошёл верификацию")
+                    await modlog(g, discord.Embed(title="Кик", description=str(m), color=GOLD))
+                except: pass
+            await remove_pending(uid, gid)
 
 
-# ==================== ВЕРИФИКАЦИЯ ====================
+# ═══════════════════ COMMANDS ═══════════════════
 
-@bot.tree.command(name="setup", description="Настроить систему верификации и модерации")
-@app_commands.describe(
-    unverified_role="Роль неверифицированных",
-    verified_role="Роль после верификации",
-    muted_role="Роль мута (классический мут)",
-    verify_channel="Канал верификации",
-    welcome_channel="Канал приветствий",
-    log_channel="Канал логов верификации",
-    mod_log_channel="Канал логов модерации",
-    timeout="Время на верификацию (минуты)"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def setup(
-    interaction: discord.Interaction,
-    unverified_role: discord.Role = None,
-    verified_role: discord.Role = None,
-    muted_role: discord.Role = None,
-    verify_channel: discord.TextChannel = None,
-    welcome_channel: discord.TextChannel = None,
-    log_channel: discord.TextChannel = None,
-    mod_log_channel: discord.TextChannel = None,
-    timeout: int = 15
-):
-    data = {}
-    if unverified_role:
-        data["unverified_role_id"] = unverified_role.id
-    if verified_role:
-        data["verified_role_id"] = verified_role.id
-    if muted_role:
-        data["muted_role_id"] = muted_role.id
-    if verify_channel:
-        data["verify_channel_id"] = verify_channel.id
-    if welcome_channel:
-        data["welcome_channel_id"] = welcome_channel.id
-    if log_channel:
-        data["log_channel_id"] = log_channel.id
-    if mod_log_channel:
-        data["mod_log_channel_id"] = mod_log_channel.id
-    data["verify_timeout"] = timeout
-
-    await set_guild_settings(interaction.guild.id, **data)
-
-    embed = discord.Embed(title="Настройки сохранены", color=COLOR_SUCCESS, timestamp=datetime.now(timezone.utc))
-    if unverified_role:
-        embed.add_field(name="Неверифицирован", value=unverified_role.mention, inline=True)
-    if verified_role:
-        embed.add_field(name="Участник", value=verified_role.mention, inline=True)
-    if muted_role:
-        embed.add_field(name="Мут-роль", value=muted_role.mention, inline=True)
-    if verify_channel:
-        embed.add_field(name="Верификация", value=verify_channel.mention, inline=True)
-    if welcome_channel:
-        embed.add_field(name="Приветствия", value=welcome_channel.mention, inline=True)
-    if log_channel:
-        embed.add_field(name="Логи верификации", value=log_channel.mention, inline=True)
-    if mod_log_channel:
-        embed.add_field(name="Логи модерации", value=mod_log_channel.mention, inline=True)
-    embed.add_field(name="Таймаут", value=f"{timeout} мин.", inline=True)
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+@bot.tree.command(name="profile", description="💎 Красивый профиль")
+@app_commands.describe(member="Чей профиль посмотреть")
+async def profile(inter: discord.Interaction, member: discord.Member = None):
+    member = member or inter.user
+    emb = await build_profile_embed(member)
+    view = ProfileView(member.id) if member.id == inter.user.id else None
+    await inter.response.send_message(embed=emb, view=view)
 
 
-@bot.tree.command(name="send_verify", description="Отправить сообщение с кнопкой верификации")
-@app_commands.checks.has_permissions(administrator=True)
-async def send_verify(interaction: discord.Interaction):
-    settings = await get_guild_settings(interaction.guild.id)
-    if not settings or not settings.get("verified_role_id"):
-        embed = discord.Embed(title="Сначала настрой бота", description="Используй `/setup`", color=COLOR_ERROR)
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
+@bot.tree.command(name="setbanner", description="🖼 Баннер профиля (GIF) — платно")
+@app_commands.describe(url="Ссылка на GIF/картинку или none")
+async def setbanner(inter: discord.Interaction, url: str):
+    if url.lower() in ("none", "удалить", "remove", "clear"):
+        await set_profile_banner(inter.user.id, inter.guild.id, None)
+        return await inter.response.send_message(embed=discord.Embed(title="Баннер убран", color=GREEN), ephemeral=True)
 
-    embed = discord.Embed(
-        title="Верификация",
-        description="Нажми кнопку ниже, чтобы получить доступ к серверу.",
-        color=COLOR_INFO
+    if not is_valid_image_url(url):
+        return await inter.response.send_message(
+            embed=discord.Embed(
+                title="Неверная ссылка",
+                description="Нужна прямая ссылка на `.png` `.jpg` `.gif` `.webp`\nИли Imgur / Tenor / Discord CDN",
+                color=RED
+            ),
+            ephemeral=True
+        )
+
+    w, _ = await get_balance(inter.user.id, inter.guild.id)
+    if w < PRICE_BANNER:
+        return await inter.response.send_message(
+            embed=discord.Embed(title="Недостаточно средств", description=f"Нужно **{PRICE_BANNER}** {CURRENCY}, у тебя **{w}**", color=RED),
+            ephemeral=True
+        )
+
+    await add_money(inter.user.id, inter.guild.id, -PRICE_BANNER)
+    await set_profile_banner(inter.user.id, inter.guild.id, url)
+    emb = discord.Embed(title="🖼 Баннер установлен", description=f"Списано **{PRICE_BANNER}** {CURRENCY}", color=GREEN)
+    emb.set_image(url=url)
+    await inter.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="setbio", description="✏️ Описание профиля — платно")
+@app_commands.describe(text="Текст (до 150 символов) или none")
+async def setbio(inter: discord.Interaction, text: str):
+    if text.lower() in ("none", "удалить", "remove", "clear"):
+        await set_profile_bio(inter.user.id, inter.guild.id, None)
+        return await inter.response.send_message("Описание убрано.", ephemeral=True)
+
+    w, _ = await get_balance(inter.user.id, inter.guild.id)
+    if w < PRICE_BIO:
+        return await inter.response.send_message(
+            embed=discord.Embed(title="Недостаточно средств", description=f"Нужно **{PRICE_BIO}** {CURRENCY}", color=RED),
+            ephemeral=True
+        )
+
+    text = text[:150]
+    await add_money(inter.user.id, inter.guild.id, -PRICE_BIO)
+    await set_profile_bio(inter.user.id, inter.guild.id, text)
+    await inter.response.send_message(
+        embed=discord.Embed(title="✏️ Био обновлено", description=f"*{text}*\n\nСписано **{PRICE_BIO}** {CURRENCY}", color=GREEN),
+        ephemeral=True
     )
-    if interaction.guild.icon:
-        embed.set_thumbnail(url=interaction.guild.icon.url)
-
-    await interaction.channel.send(embed=embed, view=VerifyView())
-    await interaction.response.send_message(embed=discord.Embed(title="Готово", color=COLOR_SUCCESS), ephemeral=True)
 
 
-# ==================== МОДЕРАЦИЯ: МУТ ====================
+@bot.tree.command(name="setcolor", description="🎨 Цвет профиля — платно")
+@app_commands.describe(color="HEX, например #FF55AA")
+async def setcolor(inter: discord.Interaction, color: str):
+    color = color.strip().lstrip("#")
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+        return await inter.response.send_message("Нужен HEX из 6 символов, например `FF55AA`", ephemeral=True)
 
-@bot.tree.command(name="mute", description="Замутить участника (роль или в одном канале)")
-@app_commands.describe(
-    member="Кого замутить",
-    reason="Причина",
-    channel="Если указать — мут только в этом канале"
-)
+    w, _ = await get_balance(inter.user.id, inter.guild.id)
+    if w < PRICE_COLOR:
+        return await inter.response.send_message(
+            embed=discord.Embed(title="Недостаточно средств", description=f"Нужно **{PRICE_COLOR}** {CURRENCY}", color=RED),
+            ephemeral=True
+        )
+
+    value = int(color, 16)
+    await add_money(inter.user.id, inter.guild.id, -PRICE_COLOR)
+    await set_profile_color(inter.user.id, inter.guild.id, value)
+    emb = discord.Embed(title="🎨 Цвет установлен", description=f"`#{color.upper()}`\nСписано **{PRICE_COLOR}** {CURRENCY}", color=value)
+    await inter.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="pay", description="Перевести деньги")
+@app_commands.describe(member="Кому", amount="Сумма")
+async def pay(inter: discord.Interaction, member: discord.Member, amount: int):
+    if amount <= 0 or member.bot or member == inter.user:
+        return await inter.response.send_message("Нельзя.", ephemeral=True)
+    if not await transfer(inter.user.id, member.id, inter.guild.id, amount):
+        return await inter.response.send_message("Недостаточно средств.", ephemeral=True)
+    await inter.response.send_message(embed=discord.Embed(
+        title="💸 Перевод", description=f"{inter.user.mention} → {member.mention}\n**{amount:,}** {CURRENCY}", color=GREEN))
+
+
+@bot.tree.command(name="rob", description="Ограбить")
+@app_commands.describe(member="Жертва")
+async def rob(inter: discord.Interaction, member: discord.Member):
+    if member.bot or member == inter.user:
+        return await inter.response.send_message("Нельзя.", ephemeral=True)
+    last = await get_cd(inter.user.id, inter.guild.id, "last_rob")
+    left = ROB_COOLDOWN - (time.time() - last)
+    if left > 0:
+        return await inter.response.send_message(f"⏳ Через **{fmt(left)}**", ephemeral=True)
+    tw, _ = await get_balance(member.id, inter.guild.id)
+    if tw < ROB_MIN:
+        return await inter.response.send_message("Мало денег у жертвы.", ephemeral=True)
+    await set_cd(inter.user.id, inter.guild.id, "last_rob", time.time())
+    if random.randint(1, 100) <= ROB_CHANCE:
+        amt = random.randint(ROB_MIN, max(ROB_MIN, int(tw * 0.25)))
+        await add_money(member.id, inter.guild.id, -amt)
+        await add_money(inter.user.id, inter.guild.id, amt)
+        emb = discord.Embed(title="🔫 Успех", description=f"**{amt:,}** {CURRENCY} у {member.mention}", color=GREEN)
+    else:
+        fine = random.randint(40, 120)
+        await add_money(inter.user.id, inter.guild.id, -fine)
+        emb = discord.Embed(title="🚔 Неудача", description=f"Штраф **{fine}** {CURRENCY}", color=RED)
+    await inter.response.send_message(embed=emb)
+
+
+@bot.tree.command(name="top", description="Топ богачей")
+async def top(inter: discord.Interaction):
+    rows = await get_top(inter.guild.id)
+    if not rows:
+        return await inter.response.send_message("Пусто.", ephemeral=True)
+    lines = []
+    for i, (uid, w, b) in enumerate(rows, 1):
+        m = inter.guild.get_member(uid)
+        name = m.display_name if m else f"ID {uid}"
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"`{i}.`")
+        lines.append(f"{medal} **{name}** — {(w+b):,} {CURRENCY}")
+    await inter.response.send_message(embed=discord.Embed(title="🏆 Топ", description="\n".join(lines), color=GOLD))
+
+
+@bot.tree.command(name="gamble", description="Казино")
+@app_commands.describe(game="Игра", amount="Ставка")
+@app_commands.choices(game=[
+    app_commands.Choice(name="Монетка x2", value="coin"),
+    app_commands.Choice(name="Слоты x2–x5", value="slots")
+])
+async def gamble(inter: discord.Interaction, game: app_commands.Choice[str], amount: int):
+    if amount <= 0:
+        return await inter.response.send_message("Ставка > 0", ephemeral=True)
+    w, _ = await get_balance(inter.user.id, inter.guild.id)
+    if w < amount:
+        return await inter.response.send_message("Недостаточно.", ephemeral=True)
+    if game.value == "coin":
+        if random.choice([True, False]):
+            await add_money(inter.user.id, inter.guild.id, amount)
+            emb = discord.Embed(title="🪙 Победа", description=f"+**{amount:,}** {CURRENCY}", color=GREEN)
+        else:
+            await add_money(inter.user.id, inter.guild.id, -amount)
+            emb = discord.Embed(title="🪙 Проигрыш", description=f"-**{amount:,}** {CURRENCY}", color=RED)
+    else:
+        icons = ["🍒", "🍋", "🍇", "⭐", "💎"]
+        roll = [random.choice(icons) for _ in range(3)]
+        show = " │ ".join(roll)
+        if len(set(roll)) == 1:
+            win = amount * 5
+            await add_money(inter.user.id, inter.guild.id, win)
+            emb = discord.Embed(title="🎰 ДЖЕКПОТ", description=f"**{show}**\n+**{win:,}** {CURRENCY}", color=GREEN)
+        elif roll[0] == roll[1] or roll[1] == roll[2]:
+            win = amount * 2
+            await add_money(inter.user.id, inter.guild.id, win)
+            emb = discord.Embed(title="🎰 Победа", description=f"**{show}**\n+**{win:,}** {CURRENCY}", color=GREEN)
+        else:
+            await add_money(inter.user.id, inter.guild.id, -amount)
+            emb = discord.Embed(title="🎰 Мимо", description=f"**{show}**\n-**{amount:,}** {CURRENCY}", color=RED)
+    await inter.response.send_message(embed=emb)
+
+
+@bot.tree.command(name="inventory", description="Инвентарь")
+async def inventory(inter: discord.Interaction):
+    items = await get_inv(inter.user.id, inter.guild.id)
+    if not items:
+        return await inter.response.send_message(embed=discord.Embed(title="Пусто", color=BLURPLE), ephemeral=True)
+    text = "\n".join(f"**{n}** ×{q}" for _, n, q, _ in items)
+    await inter.response.send_message(embed=discord.Embed(title=f"🎒 {inter.user.display_name}", description=text, color=PINK))
+
+
+@bot.tree.command(name="mute", description="Мут")
+@app_commands.describe(member="Кого", reason="Причина", channel="Канал")
 @app_commands.checks.has_permissions(moderate_members=True)
-async def mute(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    reason: str = "Не указана",
-    channel: discord.TextChannel = None
-):
-    if member.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
-        embed = discord.Embed(title="Ошибка", description="Нельзя мутить этого участника.", color=COLOR_ERROR)
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
-
+async def mute_cmd(inter: discord.Interaction, member: discord.Member, reason: str = "—", channel: discord.TextChannel = None):
+    if member.top_role >= inter.user.top_role and inter.user != inter.guild.owner:
+        return await inter.response.send_message("Нельзя.", ephemeral=True)
     if channel:
-        overwrite = channel.overwrites_for(member)
-        overwrite.send_messages = False
-        overwrite.add_reactions = False
+        ow = channel.overwrites_for(member)
+        ow.send_messages = False
         try:
-            await channel.set_permissions(member, overwrite=overwrite, reason=reason)
-            await add_channel_mute(member.id, interaction.guild.id, channel.id, reason, interaction.user.id, time.time())
-        except discord.Forbidden:
-            embed = discord.Embed(title="Ошибка", description="Нет прав менять права в канале.", color=COLOR_ERROR)
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        embed = discord.Embed(
-            title="Мут в канале",
-            description=f"{member.mention} замучен в {channel.mention}",
-            color=COLOR_MUTE,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Причина", value=reason)
-        embed.add_field(name="Модератор", value=interaction.user.mention)
-        await send_mod_log(interaction.guild, embed)
-        await interaction.response.send_message(embed=embed)
+            await channel.set_permissions(member, overwrite=ow, reason=reason)
+            await add_channel_mute(member.id, inter.guild.id, channel.id, reason, inter.user.id, time.time())
+        except: return await inter.response.send_message("Нет прав.", ephemeral=True)
+        emb = discord.Embed(title="🔇 Мут в канале", description=f"{member.mention} → {channel.mention}", color=GOLD)
     else:
-        success = await apply_muted_role(member, reason=reason)
-        if not success:
-            embed = discord.Embed(
-                title="Ошибка",
-                description="Роль мута не настроена или нет прав. Используй `/setup` и укажи `muted_role`.",
-                color=COLOR_ERROR
-            )
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        embed = discord.Embed(
-            title="Участник замучен",
-            description=f"{member.mention} получил мут.",
-            color=COLOR_MUTE,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Причина", value=reason)
-        embed.add_field(name="Модератор", value=interaction.user.mention)
-        embed.set_thumbnail(url=member.display_avatar.url)
-        await send_mod_log(interaction.guild, embed)
-        await interaction.response.send_message(embed=embed)
+        if not await mute_role(member, reason):
+            return await inter.response.send_message("Роль мута не настроена.", ephemeral=True)
+        emb = discord.Embed(title="🔇 Мут", description=member.mention, color=GOLD)
+    emb.add_field(name="Причина", value=reason)
+    await modlog(inter.guild, emb)
+    await inter.response.send_message(embed=emb)
 
 
-@bot.tree.command(name="unmute", description="Размутить участника")
-@app_commands.describe(
-    member="Кого размутить",
-    channel="Если указать — снять мут только с этого канала"
-)
+@bot.tree.command(name="unmute", description="Размут")
+@app_commands.describe(member="Кого", channel="Канал")
 @app_commands.checks.has_permissions(moderate_members=True)
-async def unmute(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    channel: discord.TextChannel = None
-):
+async def unmute_cmd(inter: discord.Interaction, member: discord.Member, channel: discord.TextChannel = None):
     if channel:
         try:
-            await channel.set_permissions(member, overwrite=None, reason="Размут")
-            await remove_channel_mute(member.id, interaction.guild.id, channel.id)
-        except discord.Forbidden:
-            embed = discord.Embed(title="Ошибка", description="Нет прав.", color=COLOR_ERROR)
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        embed = discord.Embed(
-            title="Размут в канале",
-            description=f"С {member.mention} снят мут в {channel.mention}",
-            color=COLOR_SUCCESS,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Модератор", value=interaction.user.mention)
-        await send_mod_log(interaction.guild, embed)
-        await interaction.response.send_message(embed=embed)
+            await channel.set_permissions(member, overwrite=None)
+            await remove_channel_mute(member.id, inter.guild.id, channel.id)
+        except: return await inter.response.send_message("Нет прав.", ephemeral=True)
+        emb = discord.Embed(title="🔊 Размут", description=f"{member.mention}", color=GREEN)
     else:
-        success = await remove_muted_role(member, reason="Размут")
-        if not success:
-            embed = discord.Embed(title="Ошибка", description="Не удалось снять роль мута.", color=COLOR_ERROR)
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        embed = discord.Embed(
-            title="Участник размучен",
-            description=f"С {member.mention} снят мут.",
-            color=COLOR_SUCCESS,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Модератор", value=interaction.user.mention)
-        embed.set_thumbnail(url=member.display_avatar.url)
-        await send_mod_log(interaction.guild, embed)
-        await interaction.response.send_message(embed=embed)
+        if not await unmute_role(member):
+            return await inter.response.send_message("Не удалось.", ephemeral=True)
+        emb = discord.Embed(title="🔊 Размут", description=member.mention, color=GREEN)
+    await modlog(inter.guild, emb)
+    await inter.response.send_message(embed=emb)
 
 
-# ==================== ЖАЛОБЫ ====================
-
-@bot.tree.command(name="report", description="Пожаловаться на участника")
-@app_commands.describe(member="На кого жалоба")
-async def report(interaction: discord.Interaction, member: discord.Member):
-    if member.bot:
-        embed = discord.Embed(title="Ошибка", description="Нельзя жаловаться на ботов.", color=COLOR_ERROR)
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
-    if member == interaction.user:
-        embed = discord.Embed(title="Ошибка", description="Нельзя жаловаться на себя.", color=COLOR_ERROR)
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    modal = ReportModal(member)
-    await interaction.response.send_modal(modal)
+@bot.tree.command(name="report", description="Жалоба")
+async def report(inter: discord.Interaction, member: discord.Member):
+    if member.bot or member == inter.user:
+        return await inter.response.send_message("Нельзя.", ephemeral=True)
+    await inter.response.send_modal(ReportModal(member))
 
 
-# ==================== АВТОМОД СЛОВ ====================
-
-@bot.tree.command(name="addword", description="Добавить запрещённое слово")
-@app_commands.describe(word="Слово (без пробелов)")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def addword(interaction: discord.Interaction, word: str):
-    word = word.lower().strip()
-    if " " in word or len(word) < 2:
-        embed = discord.Embed(title="Ошибка", description="Слово должно быть одним и минимум 2 символа.", color=COLOR_ERROR)
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    await add_bad_word(interaction.guild.id, word)
-    embed = discord.Embed(title="Слово добавлено", description=f"`{word}` теперь в чёрном списке.", color=COLOR_SUCCESS)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="removeword", description="Удалить запрещённое слово")
-@app_commands.describe(word="Слово")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def removeword(interaction: discord.Interaction, word: str):
-    await remove_bad_word(interaction.guild.id, word.lower().strip())
-    embed = discord.Embed(title="Слово удалено", description=f"`{word}` убрано из списка.", color=COLOR_SUCCESS)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="wordlist", description="Показать список запрещённых слов")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def wordlist(interaction: discord.Interaction):
-    words = await get_bad_words(interaction.guild.id)
-    if not words:
-        embed = discord.Embed(title="Чёрный список пуст", color=COLOR_INFO)
-    else:
-        embed = discord.Embed(
-            title="Запрещённые слова",
-            description=", ".join(f"`{w}`" for w in words),
-            color=COLOR_INFO
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ==================== ПРОЧЕЕ ====================
-
-@bot.tree.command(name="settings", description="Показать текущие настройки")
+@bot.tree.command(name="additem", description="Товар в магазин")
+@app_commands.describe(name="Название", price="Цена", description="Описание", role="Роль")
 @app_commands.checks.has_permissions(administrator=True)
-async def settings_cmd(interaction: discord.Interaction):
-    settings = await get_guild_settings(interaction.guild.id)
-    if not settings:
-        embed = discord.Embed(title="Настройки не найдены", description="Используй `/setup`", color=COLOR_ERROR)
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    def r(rid):
-        return f"<@&{rid}>" if rid else "`—`"
-    def c(cid):
-        return f"<#{cid}>" if cid else "`—`"
-
-    embed = discord.Embed(title="Текущие настройки", color=COLOR_INFO, timestamp=datetime.now(timezone.utc))
-    embed.add_field(name="Неверифицирован", value=r(settings.get("unverified_role_id")), inline=True)
-    embed.add_field(name="Участник", value=r(settings.get("verified_role_id")), inline=True)
-    embed.add_field(name="Мут-роль", value=r(settings.get("muted_role_id")), inline=True)
-    embed.add_field(name="Верификация", value=c(settings.get("verify_channel_id")), inline=True)
-    embed.add_field(name="Приветствия", value=c(settings.get("welcome_channel_id")), inline=True)
-    embed.add_field(name="Логи верif.", value=c(settings.get("log_channel_id")), inline=True)
-    embed.add_field(name="Логи модерации", value=c(settings.get("mod_log_channel_id")), inline=True)
-    embed.add_field(name="Таймаут", value=f"{settings.get('verify_timeout', 15)} мин.", inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+async def additem(inter: discord.Interaction, name: str, price: int, description: str = "", role: discord.Role = None):
+    await add_shop_item(inter.guild.id, name, price, description, role.id if role else None)
+    emb = discord.Embed(title="🛒 Добавлено", description=f"**{name}** — {price} {CURRENCY}", color=GREEN)
+    if role: emb.add_field(name="Роль", value=role.mention)
+    await inter.response.send_message(embed=emb)
 
 
-# ==================== ЗАПУСК ====================
+@bot.tree.command(name="setup", description="Настройка")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup(inter: discord.Interaction,
+                unverified_role: discord.Role = None, verified_role: discord.Role = None,
+                muted_role: discord.Role = None, verify_channel: discord.TextChannel = None,
+                welcome_channel: discord.TextChannel = None, log_channel: discord.TextChannel = None,
+                mod_log_channel: discord.TextChannel = None, timeout: int = 15):
+    data = {}
+    if unverified_role: data["unverified_role_id"] = unverified_role.id
+    if verified_role: data["verified_role_id"] = verified_role.id
+    if muted_role: data["muted_role_id"] = muted_role.id
+    if verify_channel: data["verify_channel_id"] = verify_channel.id
+    if welcome_channel: data["welcome_channel_id"] = welcome_channel.id
+    if log_channel: data["log_channel_id"] = log_channel.id
+    if mod_log_channel: data["mod_log_channel_id"] = mod_log_channel.id
+    data["verify_timeout"] = timeout
+    await set_guild_settings(inter.guild.id, **data)
+    await inter.response.send_message(embed=discord.Embed(title="✅ Сохранено", color=GREEN), ephemeral=True)
+
+
+@bot.tree.command(name="send_verify", description="Кнопка верификации")
+@app_commands.checks.has_permissions(administrator=True)
+async def send_verify(inter: discord.Interaction):
+    emb = discord.Embed(title="🔐 Верификация", description="Нажми кнопку, чтобы получить доступ.", color=BLURPLE)
+    if inter.guild.icon: emb.set_thumbnail(url=inter.guild.icon.url)
+    await inter.channel.send(embed=emb, view=VerifyView())
+    await inter.response.send_message("Готово", ephemeral=True)
+
+
+@bot.tree.command(name="addword", description="Запретить слово")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def addword(inter: discord.Interaction, word: str):
+    await add_bad_word(inter.guild.id, word.strip().lower())
+    await inter.response.send_message(f"`{word}` добавлено.", ephemeral=True)
+
 
 async def main():
     async with bot:

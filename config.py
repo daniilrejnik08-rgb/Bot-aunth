@@ -1,25 +1,36 @@
 TOKEN = "ТВОЙ_ТОКЕН_БОТА"
 
-# Время на верификацию (в минутах)
 VERIFY_TIMEOUT = 15
 
-# ===== Антиспам =====
-SPAM_MESSAGES = 5          # Сколько сообщений
-SPAM_SECONDS = 5           # За сколько секунд
-SPAM_MUTE_MINUTES = 10     # На сколько мутить за спам
+SPAM_MESSAGES = 5
+SPAM_SECONDS = 5
+SPAM_MUTE_MINUTES = 10
+MAX_MENTIONS = 5
+BAD_WORDS_ACTION = "delete"
 
-# ===== Антирассылка =====
-MAX_MENTIONS = 5           # Максимум упоминаний в одном сообщении
-MAX_EVERYONE = 1           # Сколько раз можно @everyone/@here
+CURRENCY = "🪙"
+START_BALANCE = 150
 
-# ===== Автомод слов =====
-BAD_WORDS_ACTION = "delete"  # delete / mute / both
+DAILY_MIN, DAILY_MAX = 250, 600
+DAILY_COOLDOWN = 86400
+WORK_MIN, WORK_MAX = 80, 200
+WORK_COOLDOWN = 3600
+CRIME_MIN, CRIME_MAX = 120, 450
+CRIME_FAIL = 100
+CRIME_CHANCE = 42
+CRIME_COOLDOWN = 7200
+ROB_CHANCE = 33
+ROB_COOLDOWN = 10800
+ROB_MIN = 40
 
-# Цвета эмбедов
-COLOR_SUCCESS = 0x57F287
-COLOR_ERROR = 0xED4245
-COLOR_INFO = 0x5865F2
-COLOR_WARNING = 0xFEE75C
-COLOR_WELCOME = 0xEB459E
-COLOR_MOD = 0xEB459E
-COLOR_MUTE = 0xFEE75C
+# Цены кастомизации профиля
+PRICE_BANNER = 500      # поставить / сменить баннер (GIF)
+PRICE_BIO = 150         # описание
+PRICE_COLOR = 200       # цвет полоски
+
+GREEN = 0x57F287
+RED = 0xED4245
+BLURPLE = 0x5865F2
+GOLD = 0xFEE75C
+PINK = 0xEB459E
+DARK = 0x2B2D31
